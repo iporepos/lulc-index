@@ -1,0 +1,50 @@
+{
+  "meta": {
+    "description": "Natural cover fraction raster pipeline spec",
+    "version": "1.0",
+    "spec_id": "mapbiomas-col10",
+    "source_legend": "MapBiomas Collection 10",
+    "notes": "Resolution labels are nominal. Values in degrees referenced to the equator (0.001° ≈ 111m, 0.01° ≈ 1.11km). At 30°S pixel area is approximately 7% larger than nominal due to latitude-dependent longitude compression. Area-sensitive applications should apply per-pixel area correction. Natural cover includes all non-managed surfaces regardless of vegetation. Water bodies (26, 33) included in natural cover. Aquaculture (31) and Forest Plantation (9) excluded from natural cover. Forest cover (fc) includes plantation for hydrological applications."
+  },
+  "source": {
+    "dir": "path/to/maps",
+    "pattern": "map_{year}.tif",
+    "years": [2001, 2023, 2026],
+    "nodata": 0,
+    "crs": "EPSG:4326"
+  },
+  "output": {
+    "dir": "/outputs",
+    "naming": "{spec_id}_{alias}_{resolution}_{year}.tif",
+    "dtype": "uint8",
+    "scale_factor": 100,
+    "nodata": 255,
+    "crs": "EPSG:4326"
+  },
+  "resolutions": {
+    "1ha": 0.001,
+    "1km": 0.01
+  },
+  "indices": {
+    "nc": {
+      "name": "Natural Cover",
+      "classes": [3, 4, 5, 6, 49, 10, 11, 12, 32, 29, 50, 26, 33, 23]
+    },
+    "ac": {
+      "name": "Anthropic Cover",
+      "complement_of": "nc"
+    },
+    "ag": {
+      "name": "Agricultural Cover",
+      "classes": [15, 18, 19, 20, 21, 36, 39, 40, 41, 46, 47, 48, 62]
+    },
+    "fc": {
+      "name": "Forest Cover",
+      "classes": [3, 4, 5, 6, 49, 9]
+    },
+    "urb": {
+      "name": "Urban Area",
+      "classes": [24]
+    }
+  }
+}
