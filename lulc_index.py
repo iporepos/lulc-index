@@ -30,9 +30,20 @@ The pipeline performs three operations per output:
       "resolutions": { "1ha": 0.001, "1km": 0.01 },
       "indices": {
         "nc": { "name": "Natural Cover", "classes": [3, 4, 5] },
-        "ac": { "name": "Anthropic Cover", "complement_of": "nc" }
+        "ac": { "name": "Anthropic Cover", "complement_of": "nc",
+                "qml": "styles/ac.qml" }
       }
     }
+
+**QGIS style sidecars (optional):**
+
+Each index may declare a ``qml`` key pointing to a QGIS style file, and the
+``output`` block may declare a ``qml`` key used as default for indices that
+do not declare their own. When set, the QML is copied next to every output
+raster with the same basename (``<output>.qml``), which QGIS loads
+automatically when the raster is opened. Relative paths are resolved against
+the spec file directory. Style class breaks must match the *scaled* values
+(e.g. 0–100 for ``uint8`` with ``scale_factor`` 100).
 
 **Source resolution modes** (in order of precedence):
 
@@ -54,10 +65,24 @@ embedded in each output GeoTIFF as tag metadata.
     At 30°S, pixel area is ~7% larger than nominal. Area-sensitive applications
     should apply a per-pixel latitude correction downstream.
 
-.. warning::
-    The current implementation loads the full source raster into memory.
-    For large areas (e.g. full Brazil at 30m), a chunked/windowed approach
-    using ``gdal.Warp`` or ``rioxarray`` + ``dask`` is recommended.
+**Processing modes:**
+
+- *Conventional* (no ``processing`` block): each output is computed by
+  loading the full source raster into memory. Kept as-is for backward
+  compatibility and reproducibility of earlier results. Not viable for very
+  large rasters (full Brazil at 30 m needs well over 100 GB per output).
+- *Tiled* (``processing`` block present)::
+
+      "processing": { "tile_size": 100, "workers": 1 }
+
+  ``tile_size`` is the tile edge in pixels of the **coarsest** resolution of
+  the spec (100 × 0.01° = 1° × 1° tiles). Resolutions stay fully independent:
+  at every resolution an output pixel belongs to the tile containing its
+  top-left corner, so tiles never overlap or leave seams. Each source window
+  is read once per tile and feeds all indices and resolutions of that year.
+  ``workers`` (default 1) sets the number of processes computing tiles; only
+  the main process writes. Output grids are identical to the conventional
+  mode. Outputs are written to ``*.partial.tif`` and renamed on success.
 
 .. note::
     This script is intended to be merged into the ``plans`` hydrology library
@@ -79,7 +104,10 @@ embedded in each output GeoTIFF as tag metadata.
 import argparse
 import json
 import logging
+import math
+import multiprocessing as mp
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -88,6 +116,8 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, calculate_default_transform
+from rasterio.windows import Window, from_bounds
+from rasterio.windows import transform as window_transform
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -191,7 +221,57 @@ def load_spec(spec_path: Path) -> dict:
     spec["output"].setdefault("scale_factor", defaults["scale_factor"])
     spec["output"].setdefault("nodata", defaults["nodata"])
 
+    _resolve_qml_paths(spec, spec_path.parent)
+    _validate_processing(spec)
+
     return spec
+
+
+def _validate_processing(spec: dict) -> None:
+    """Validate the optional ``processing`` block and apply its defaults.
+
+    Absent block = conventional (in-memory) mode, nothing to check.
+
+    :param spec: Loaded spec dict, modified in place.
+    :raises ValueError: If ``tile_size`` or ``workers`` are not positive integers.
+    """
+    proc = spec.get("processing")
+    if proc is None:
+        return
+    if not isinstance(proc, dict):
+        raise ValueError("'processing' must be an object.")
+    unknown = set(proc) - {"tile_size", "workers"}
+    if unknown:
+        log.warning(f"Unknown keys in 'processing' ignored: {sorted(unknown)}")
+    proc.setdefault("tile_size", 100)
+    proc.setdefault("workers", 1)
+    for key in ("tile_size", "workers"):
+        val = proc[key]
+        if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+            raise ValueError(f"processing.{key} must be a positive integer, got {val!r}.")
+
+
+def _resolve_qml_paths(spec: dict, base_dir: Path) -> None:
+    """Resolve and validate optional ``qml`` style paths in place.
+
+    Looks at ``output.qml`` (default for all indices) and ``indices.<alias>.qml``.
+    Relative paths are resolved against ``base_dir`` (the spec file directory).
+
+    :param spec: Loaded spec dict, modified in place.
+    :param base_dir: Directory used to resolve relative paths.
+    :raises FileNotFoundError: If a declared QML file does not exist.
+    """
+    targets = [("output", spec["output"])]
+    targets += [(f"indices.{a}", idx) for a, idx in spec["indices"].items()]
+    for where, block in targets:
+        if not block.get("qml"):
+            continue
+        path = Path(block["qml"]).expanduser()
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"QML style not found ({where}.qml): {path}")
+        block["qml"] = path
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +387,7 @@ def resolve_indices(indices: dict) -> dict:
         - ``classes`` (list[int]) — target class codes.
         - ``is_complement`` (bool) — whether to apply ``1 - fraction``.
         - ``source_alias`` (str, complement only) — alias of the referenced index.
+        - ``qml`` (Path | None) — QGIS style file for the sidecar, if declared.
 
     :raises ValueError: If a ``complement_of`` reference points to an unknown alias
         or to another complement index.
@@ -320,6 +401,7 @@ def resolve_indices(indices: dict) -> dict:
                 "name": idx["name"],
                 "classes": idx["classes"],
                 "is_complement": False,
+                "qml": idx.get("qml"),
             }
 
     # pass 2 — complement indices
@@ -336,6 +418,7 @@ def resolve_indices(indices: dict) -> dict:
                 "classes": resolved[source_alias]["classes"],
                 "is_complement": True,
                 "source_alias": source_alias,
+                "qml": idx.get("qml"),
             }
 
     return resolved
@@ -490,6 +573,342 @@ def build_output_path(
 
 
 # ---------------------------------------------------------------------------
+# Tiled processing
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-9
+
+_W_SRC = None
+"""Source dataset opened once per worker process (tiled mode)."""
+_W_CTX = None
+"""Shared, read-only job context per worker process (tiled mode)."""
+
+
+def _encode(dst: np.ndarray, output: dict) -> np.ndarray:
+    """Scale a 0–1 float fraction array (NaN = nodata) to the output dtype.
+
+    Same encoding as :func:`compute_fraction`.
+    """
+    np_dtype = NUMPY_DTYPES[output["dtype"]]
+    valid = ~np.isnan(dst)
+    result = np.full(dst.shape, output["nodata"], dtype=np_dtype)
+    if output["dtype"] == "float32":
+        result[valid] = dst[valid].astype(np_dtype)
+    else:
+        result[valid] = np.round(dst[valid] * output["scale_factor"]).astype(np_dtype)
+    return result
+
+
+def _plan_grids(src, resolutions: dict) -> dict:
+    """Full output grid per resolution, identical to the conventional mode.
+
+    :returns: ``{label: (transform, width, height, res)}``.
+    """
+    grids = {}
+    for label, res in resolutions.items():
+        t, w, h = calculate_default_transform(
+            src.crs, src.crs, src.width, src.height, *src.bounds, resolution=res,
+        )
+        grids[label] = (t, w, h, res)
+    return grids
+
+
+def _tile_edges(n_tiles: int, tile_ext: float, res: float, size: int) -> list[int]:
+    """Pixel offsets where each tile starts along one axis, plus the end.
+
+    A pixel belongs to the tile containing its leading edge, so edges are
+    ``ceil(i * tile_ext / res)``; consecutive tiles share edges (no gaps,
+    no overlaps). The last edge is clamped to the grid size.
+    """
+    edges = [min(size, max(0, math.ceil(i * tile_ext / res - _EPS))) for i in range(n_tiles)]
+    edges.append(size)
+    return edges
+
+
+def _plan_tiles(src, grids: dict, tile_size: int) -> list[dict]:
+    """Split all output grids into common geographic tiles.
+
+    :returns: List of jobs, each with ``src_window`` (or ``None`` when the
+        tile is outside the source) and ``out`` = ``{label: Window}``.
+    """
+    coarsest = max(g[3] for g in grids.values())
+    tile_ext = tile_size * coarsest
+    n_cols = max(math.ceil(g[1] * g[3] / tile_ext - _EPS) for g in grids.values())
+    n_rows = max(math.ceil(g[2] * g[3] / tile_ext - _EPS) for g in grids.values())
+
+    col_edges = {k: _tile_edges(n_cols, tile_ext, g[3], g[1]) for k, g in grids.items()}
+    row_edges = {k: _tile_edges(n_rows, tile_ext, g[3], g[2]) for k, g in grids.items()}
+    full = Window(0, 0, src.width, src.height)
+
+    jobs = []
+    for ti in range(n_rows):
+        for tj in range(n_cols):
+            out = {}
+            xs, ys = [], []
+            for k, (t, w, h, res) in grids.items():
+                c0, c1 = col_edges[k][tj], col_edges[k][tj + 1]
+                r0, r1 = row_edges[k][ti], row_edges[k][ti + 1]
+                if c1 <= c0 or r1 <= r0:
+                    continue
+                win = Window(c0, r0, c1 - c0, r1 - r0)
+                out[k] = win
+                left, top = t * (c0, r0)
+                right, bottom = t * (c1, r1)
+                xs += [left, right]
+                ys += [top, bottom]
+            if not out:
+                continue
+
+            # source window covering every owned output pixel, +1 px margin
+            sw = from_bounds(min(xs), min(ys), max(xs), max(ys), src.transform)
+            c0 = math.floor(sw.col_off) - 1
+            r0 = math.floor(sw.row_off) - 1
+            c1 = math.ceil(sw.col_off + sw.width) + 1
+            r1 = math.ceil(sw.row_off + sw.height) + 1
+            sw = Window(c0, r0, c1 - c0, r1 - r0)
+            try:
+                sw = sw.intersection(full)
+                if sw.width <= 0 or sw.height <= 0:
+                    sw = None
+            except Exception:  # WindowError: no overlap
+                sw = None
+            jobs.append({"src_window": sw, "out": out})
+    return jobs
+
+
+def _process_tile(job: dict, src=None, ctx=None) -> dict | None:
+    """Compute all index × resolution blocks of one tile.
+
+    :returns: ``{(alias, label): uint/float array}`` or ``None`` when the
+        tile holds only source nodata (caller writes nodata blocks).
+    """
+    src = src if src is not None else _W_SRC
+    ctx = ctx if ctx is not None else _W_CTX
+    sw = job["src_window"]
+    if sw is None:
+        return None
+
+    data = src.read(1, window=sw)
+    nodata_mask = data == ctx["src_nodata"]
+    if nodata_mask.all():
+        return None
+    sw_transform = window_transform(sw, src.transform)
+
+    results = {}
+    base_cache = {}
+    for alias, idx in ctx["indices"].items():
+        key = tuple(sorted(idx["classes"]))
+        if key not in base_cache:
+            base_cache[key] = compute_binary_mask(data, idx["classes"])
+        mask = base_cache[key]
+        mask = (1.0 - mask) if idx["is_complement"] else mask.copy()
+        mask[nodata_mask] = np.nan
+
+        for label, win in job["out"].items():
+            t = ctx["grids"][label][0]
+            dst = np.full((int(win.height), int(win.width)), np.nan, dtype=np.float32)
+            reproject(
+                mask, dst,
+                src_transform=sw_transform,
+                src_crs=src.crs,
+                dst_transform=window_transform(win, t),
+                dst_crs=src.crs,
+                resampling=Resampling.average,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+            )
+            results[(alias, label)] = _encode(dst, ctx["output"])
+    return results
+
+
+def _worker_init(src_path: str, ctx: dict) -> None:
+    """Pool initializer: open the source once per worker process."""
+    global _W_SRC, _W_CTX
+    _W_SRC = rasterio.open(src_path)
+    _W_CTX = ctx
+
+
+def _provenance_tags(spec_id, alias, idx, res_label, output, year, extra=None) -> dict:
+    """GeoTIFF tag metadata written to each output."""
+    tags = dict(
+        spec_id=spec_id,
+        index_alias=alias,
+        index_name=idx["name"],
+        resolution=res_label,
+        scale_factor=str(output["scale_factor"]),
+        created=datetime.now().isoformat(timespec="seconds"),
+    )
+    if year is not None:
+        tags["year"] = str(year)
+    if extra:
+        tags.update(extra)
+    return tags
+
+
+def run_tiled_year(
+    spec_id: str,
+    year: int | None,
+    src_path: Path,
+    indices: dict,
+    resolutions: dict,
+    source: dict,
+    output: dict,
+    processing: dict,
+    dry_run: bool,
+) -> tuple[int, int, int]:
+    """Compute every pending index × resolution output of one source file tile by tile.
+
+    The source is read once per tile for all outputs. Outputs that already
+    exist are skipped (style sidecar backfilled), as in the conventional mode.
+
+    :returns: ``(completed, skipped, failed)`` counts for this year.
+    """
+    tile_size = processing["tile_size"]
+    workers = processing["workers"]
+
+    pending = {}
+    skipped = 0
+    for alias, idx in indices.items():
+        for res_label in resolutions:
+            out_path = build_output_path(output, spec_id, alias, year, res_label)
+            qml_src = idx.get("qml") or output.get("qml")
+            if dry_run:
+                log.info(f"  [dry-run] {alias} | {year} | {res_label} → {out_path.name}"
+                         + (f" (style {qml_src.name})" if qml_src else ""))
+                skipped += 1
+                continue
+            if out_path.exists():
+                log.info(f"  {out_path.name} exists, skipping.")
+                if qml_src and not out_path.with_suffix(".qml").is_file():
+                    write_qml_sidecar(qml_src, out_path)
+                    log.info("  Style sidecar added.")
+                skipped += 1
+                continue
+            pending[(alias, res_label)] = (out_path, qml_src)
+
+    with rasterio.open(src_path) as src:
+        grids = _plan_grids(src, resolutions)
+        jobs = _plan_tiles(src, grids, tile_size)
+        n_src = sum(1 for j in jobs if j["src_window"] is not None)
+        log.info(
+            f"  Tiled: {year} | tile_size {tile_size} "
+            f"({tile_size * max(resolutions.values()):g}° tiles) | {len(jobs)} tiles "
+            f"({n_src} overlap the source) | workers {workers} | "
+            f"{len(pending)} output(s) pending"
+        )
+        if dry_run or not pending:
+            return 0, skipped, 0
+
+        # only compute what is pending
+        ctx = {
+            "indices": {a: indices[a] for a in {a for a, _ in pending}},
+            "grids": grids,
+            "src_nodata": source.get("nodata", 0),
+            "output": output,
+        }
+        labels_needed = {lab for _, lab in pending}
+        for j in jobs:
+            j["out"] = {k: w for k, w in j["out"].items() if k in labels_needed}
+
+        handles = {}
+        partials = {}
+        try:
+            for (alias, label), (out_path, _) in pending.items():
+                t, w, h, _res = grids[label]
+                profile = {
+                    "driver": "GTiff",
+                    "dtype": output["dtype"],
+                    "width": w,
+                    "height": h,
+                    "count": 1,
+                    "crs": src.crs,
+                    "transform": t,
+                    "nodata": output["nodata"],
+                    "compress": "lzw",
+                    "tiled": True,
+                    "blockxsize": 256,
+                    "blockysize": 256,
+                    "BIGTIFF": "IF_SAFER",
+                }
+                part = out_path.with_name(out_path.stem + ".partial.tif")
+                part.unlink(missing_ok=True)
+                partials[(alias, label)] = part
+                handles[(alias, label)] = rasterio.open(part, "w", **profile)
+
+            np_dtype = NUMPY_DTYPES[output["dtype"]]
+
+            def write(job, res):
+                for (alias, label), dst in handles.items():
+                    win = job["out"].get(label)
+                    if win is None:
+                        continue
+                    if res is None:
+                        arr = np.full((int(win.height), int(win.width)),
+                                      output["nodata"], dtype=np_dtype)
+                    else:
+                        arr = res[(alias, label)]
+                    dst.write(arr, 1, window=win)
+
+            step = max(1, len(jobs) // 20)
+            if workers == 1:
+                stream = ((j, _process_tile(j, src, ctx)) for j in jobs)
+                pool = None
+            else:
+                pool = mp.get_context("fork").Pool(
+                    workers, initializer=_worker_init, initargs=(str(src_path), ctx),
+                )
+                # ordered results keep writes in row-major order (GTiff block cache friendly)
+                stream = zip(jobs, pool.imap(_process_tile, jobs, chunksize=1))
+            try:
+                for n, (job, res) in enumerate(stream, 1):
+                    write(job, res)
+                    if n % step == 0 or n == len(jobs):
+                        log.info(f"  tiles {n}/{len(jobs)} ({100 * n / len(jobs):.0f}%)")
+            finally:
+                if pool is not None:
+                    pool.close()
+                    pool.join()
+
+            for (alias, label), dst in handles.items():
+                dst.update_tags(**_provenance_tags(
+                    spec_id, alias, indices[alias], label, output, year,
+                    extra={"processing": "tiled", "tile_size": str(tile_size)},
+                ))
+                dst.close()
+        except Exception as e:
+            log.error(f"  FAILED ({year}): {e}")
+            for dst in handles.values():
+                if not dst.closed:
+                    dst.close()
+            for part in partials.values():
+                part.unlink(missing_ok=True)
+            return 0, skipped, len(pending)
+
+    completed = 0
+    for key, (out_path, qml_src) in pending.items():
+        partials[key].replace(out_path)
+        log.info(f"  Written: {out_path}")
+        if write_qml_sidecar(qml_src, out_path):
+            log.info(f"  Style:   {out_path.with_suffix('.qml').name}")
+        completed += 1
+    return completed, skipped, 0
+
+
+def write_qml_sidecar(qml_src: Path | None, raster_path: Path) -> Path | None:
+    """Copy a QGIS style file next to a raster as ``<raster stem>.qml``.
+
+    :param qml_src: Template QML path, or ``None`` to do nothing.
+    :param raster_path: Output raster path the sidecar belongs to.
+    :returns: Path of the written sidecar, or ``None`` if no style was set.
+    """
+    if qml_src is None:
+        return None
+    dst = raster_path.with_suffix(".qml")
+    shutil.copyfile(qml_src, dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -549,14 +968,26 @@ def run_pipeline(
     completed = 0
     skipped = 0
     failed = 0
+    processing = spec.get("processing")
 
     for year, src_path in source_files:
+        if processing is not None:
+            c, s_, f = run_tiled_year(
+                spec_id, year, src_path, resolved_indices, resolutions,
+                source, output, processing, dry_run,
+            )
+            completed += c
+            skipped += s_
+            failed += f
+            continue
+
         for alias, idx in resolved_indices.items():
             for res_label, res_value in resolutions.items():
 
                 out_path = build_output_path(
                     output, spec_id, alias, year, res_label
                 )
+                qml_src = idx.get("qml") or output.get("qml")
 
                 log.info(
                     f"[{completed + skipped + failed + 1}/{total}] "
@@ -564,12 +995,18 @@ def run_pipeline(
                 )
 
                 if dry_run:
+                    if qml_src:
+                        log.info(f"  [dry-run] style sidecar from {qml_src}")
                     log.info("  [dry-run] skipping computation")
                     skipped += 1
                     continue
 
                 if out_path.exists():
                     log.info("  Output exists, skipping.")
+                    # backfill the style sidecar for outputs from earlier runs
+                    if qml_src and not out_path.with_suffix(".qml").is_file():
+                        write_qml_sidecar(qml_src, out_path)
+                        log.info("  Style sidecar added.")
                     skipped += 1
                     continue
 
@@ -598,6 +1035,8 @@ def run_pipeline(
                         dst.update_tags(**tags)
 
                     log.info(f"  Written: {out_path}")
+                    if write_qml_sidecar(qml_src, out_path):
+                        log.info(f"  Style:   {out_path.with_suffix('.qml').name}")
                     completed += 1
 
                 except Exception as e:
