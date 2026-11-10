@@ -7,14 +7,14 @@
     "notes": "Resolution labels are nominal. Values in degrees referenced to the equator (0.001° ≈ 111m, 0.01° ≈ 1.11km). At 30°S pixel area is approximately 7% larger than nominal due to latitude-dependent longitude compression. Area-sensitive applications should apply per-pixel area correction. Natural cover includes all non-managed surfaces regardless of vegetation. Water bodies (26, 33) included in natural cover. Aquaculture (31) and Forest Plantation (9) excluded from natural cover. Forest cover (fc) includes plantation for hydrological applications."
   },
   "source": {
-    "dir": "/media/ipo/Feynman/planalto/MAPBIOMAS/MB-BRASIL-LULC/C10/T1/ASSETS",
+    "dir": "/path/to/MAPBIOMAS/MB-BRASIL-LULC/C10/T1/ASSETS",
     "pattern": "MAPBIOMAS_BRASIL_LULC_C10_BRASIL_{year}.tif",
     "years": [1986, 1987, 1988, 1989, 1990],
     "nodata": 0,
     "crs": "EPSG:4326"
   },
   "output": {
-    "dir": "/home/ipo/Data/outputs/brazil_lulc",
+    "dir": "/path/to/Data/outputs/brazil_lulc",
     "naming": "{spec_id}_{alias}_{resolution}_{year}.tif",
     "dtype": "uint8",
     "scale_factor": 100,
@@ -33,27 +33,27 @@
     "NAT": {
       "name": "Natural Cover",
       "classes": [3, 4, 5, 6, 49, 10, 11, 12, 32, 29, 50, 26, 33, 23],
-      "qml": "/home/ipo/Data/inputs/nat.qml"
+      "qml": "/path/to/Data/inputs/nat.qml"
     },
     "AGR": {
       "name": "Agricultural Cover",
       "classes": [15, 18, 19, 20, 21, 36, 39, 40, 41, 46, 47, 48, 62],
-      "qml": "/home/ipo/Data/inputs/agr.qml"
+      "qml": "/path/to/Data/inputs/agr.qml"
     },
     "FOR": {
       "name": "Forest Cover",
       "classes": [3, 4, 5, 6, 49, 9],
-      "qml": "/home/ipo/Data/inputs/for.qml"
+      "qml": "/path/to/Data/inputs/for.qml"
     },
     "SIL": {
       "name": "Silviculture",
       "classes": [9],
-      "qml": "/home/ipo/Data/inputs/sil.qml"
+      "qml": "/path/to/Data/inputs/sil.qml"
     },
     "URB": {
       "name": "Urban Area",
       "classes": [24],
-      "qml": "/home/ipo/Data/inputs/urb.qml"
+      "qml": "/path/to/Data/inputs/urb.qml"
     }
   }
 }
